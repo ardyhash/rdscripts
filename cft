@@ -1,0 +1,748 @@
+#!/bin/bash
+# Cloud Foundry Tools
+# https://github.com/ardyhash/rdscripts
+# Dependencies: cf commandline utility, bash (tr, awk, grep, sort, head, tail, xargs), jq
+#
+# To fix windows line endings in git-bash or cygwin use:
+# cat cft | tr -d '\r' > cft2 && cat cft2 > cft && rm cft2
+
+#set -x
+export scriptName=$(basename -- "$0")
+export numberRE='^[0-9]+$'
+export configHome=~/.rdscripts
+export tmpFolder=${configHome}/tmp
+export cfTmpHome=${configHome}/.rdcftmp
+export ssoSites="pci.exmple.org hipaa.example.org"
+export restartDenominator=7
+export refreshDenominator=5
+export denominator=$restartDenominator
+export paramCommand=$1
+export retryWait=5
+export sleepTime=10
+export healthCheckPaths="/health /actuator/health /"
+export healthyString="is Healthy"
+export unhealthyString="is Unhealthy"
+export basicAuth=$(if [ -f ~/.rdscripts/proptools/envAuth ]; then cat ~/.rdscripts/proptools/envAuth; else echo ""; fi)
+export propertiesToUpdate=$(if [ -f propstoupdate ]; then cat propstoupdate | tr "\n" "&"; else echo ""; fi)
+export authTokenURL=$(if [ -f ~/.rdscripts/cf/authToken ]; then cat ~/.rdscripts/cf/authToken | grep authTokenURL | awk '{print $2}'; else echo ""; fi)
+export authTokenMethod=$(if [ -f ~/.rdscripts/cf/authToken ]; then cat ~/.rdscripts/cf/authToken | grep authTokenMethod | awk '{print $2}'; else echo ""; fi)
+export authTokenClientId=$(if [ -f ~/.rdscripts/cf/authToken ]; then cat ~/.rdscripts/cf/authToken | grep authTokenClientId | awk '{print $2}'; else echo ""; fi)
+export authTokenClientSecret=$(if [ -f ~/.rdscripts/cf/authToken ]; then cat ~/.rdscripts/cf/authToken | grep authTokenClientSecret | awk '{print $2}'; else echo ""; fi)
+export authTokenClientScope=$(if [ -f ~/.rdscripts/cf/authToken ]; then cat ~/.rdscripts/cf/authToken | grep authTokenClientScope | awk '{print $2}'; else echo ""; fi)
+
+mkdir -p ${configHome} ${cfTmpHome} ${tmpFolder}
+if [ -f ${configHome}/cftools.config ]; then source ${configHome}/cftools.config
+else
+  printf "#!/bin/bash\n#cftools Configuration File\n"> ${configHome}/cftools.config
+  printf "isAdmin=1" >> ${configHome}/cftools.config
+fi
+
+#source ${configHome}/basicAuth
+#source ${configHome}/authToken
+
+
+function helptext { # leverages cat and here-document to display man page
+cat <<HELP
+Cloud Foundry Tools
+./$scriptName COMMAND [ARG1 ARG2 ARG3...]
+Commands: info, clean, d (debug), lc (list crashed), lh (list health), lhi (list instance health), rc (restart crashed), rce (recent crash events), bp (buildpacks), lp (list properties), lpi (list instance properties), lo (list older), ln (list newer), ll (list logs), sa (service audit), uaa (user access audit), i (inventory), fai (for all in)
+Rampage/Status:			$scriptName kill/status
+Debug (Dial up verbosity):	$scriptName d parameter[s]
+List All (or subset):		$scriptName la [APPNAME]
+List Instance information:	$scriptName li [APPNAME]
+List Logs:			$scriptName ll [APPNAME]
+List Properties:		$scriptName lp [APPNAME] [MATCH] [GREPARGS]
+List Buildpacks:		$scriptName bp [APPNAME]
+Recent Crash Events:		$scriptName rce [APPNAME]
+List Older:                     $scriptName lo [APPNAME] YYYY-MM-DDTHH:MM:SSZ
+List Newer:                     $scriptName ln [APPNAME] YYYY-MM-DDTHH:MM:SSZ
+All Recent Crash Events:	$scriptName arce
+List Libraries			$scriptName lb [APPNAME] [LIBRARY] [GREPARGS]
+Restart/Refresh App Instance:	$scriptName rai/rfi/lhi/lpi APPNAME INST [SEARCHCRITERIA]
+Rolling Restart/Refresh:	$scriptName rr/rf/lh/lp APPNAME
+Rolling Restart/Refresh:	$scriptName rr/rf/lh/lp APPNAME INSTCOUNT
+Rolling Restart/Refresh:	$scriptName rr/rf/lh/lp APPNAME FIRSTINST LASTINST
+Rolling Restart/Refresh:	$scriptName rr/rf/lh/lp APPNAME FIRSTINST LASTINST INSTCOUNT
+
+APPNAME may be replaced with a quoted space deliminated list of app names. A period [.] may be used as a wildcard for APPNAME.
+Using a "d" as the first argument will enable "Debug mode" and dial up the verbosity.
+Use -1 to unleash unlimited concurrent instances
+
+Cloud Foundry Login
+Login to cf site and upon success add the site to cfhosts config file. May use partial matches as shortcuts, passing anything as a 4th parameter will enable sso-login along with any sites set in the ssoSites space deliminated variable.
+$scriptName l api.cfsite.org [cf-org] [cf-space] [sso-option]
+
+For All In
+Iterate through all sites, orgs, spaces, and optionally items (apps, services) running a command or executing a script against each.
+$scriptName fai [-d datacenter] [-o org] [-s site] [-i app | -i service] cf ...
+
+Grant User Access
+Iterate through all sites, orgs, and optionally spaces granting users the defines roles.
+$scriptName gua [-d datacenter] [-o org] -u username1 -r RoleName1 -u username2 -r rolename2 ... 
+
+Cloud Foundry Tools Helper
+Runs the Cloud Foundry Tool against multiple datacenters, may also be used to run cf cli or generic commands/scripts, predecessor to "For All In".
+$scriptName h ["dcs:as-g9 po wc ame1-g1 amw2-g1"] "ORGS1 ORG2 ..." "SPACE1 SPACE2 ..." CFTOOLSARGS
+$scriptName h ["dcs:as-g9 po wc ame1-g1 amw2-g1"] "ORGS1 ORG2 ..." "SPACE1 SPACE2 ..." cf CFCLIARGS
+$scriptName h ["dcs:as-g9 po wc ame1-g1 amw2-g1"] "ORGS1 ORG2 ..." "SPACE1 SPACE2 ..." cmd CMDS
+
+HELP
+}
+
+function fin { SetCfHome clean; export finished=yes; }; export -f fin
+
+function SetCfHome {
+  if [ -z "$1" ]; then
+    if [[ ! -d $cfTmpHome ]]; then
+      mkdir $cfTmpHome
+    fi
+    if [[ -d $CF_HOME ]] && [[ -d $cfTmpHome ]]; then
+      export CF_HOME_OLD=$CF_HOME
+      cp $CF_HOME $cfTmpHome/$PPID.$BASHPID -rf 2>/dev/null && export CF_HOME=$cfTmpHome/$PPID.$BASHPID
+    fi
+  elif [[ $1 = "clean" ]] && echo $CF_HOME | grep $cfTmpHome > /dev/null && [ -n "$CF_HOME_OLD" ]; then
+    if [[ ! "$CF_HOME" = "$CF_HOME_OLD" ]]; then rm -rf $CF_HOME; export CF_HOME=$CF_HOME_OLD; fi
+  fi
+}; export -f SetCfHome
+
+function GrepWithArgs {
+  if [ -z "$1" ] && [ -z "$2" ]; then cat; return; fi
+  grep --color $(grepArgs=''; for arg in $1; do grepArgs+="-ie $arg "; done; grepArgs+="$2"; echo "$grepArgs")
+}; export -f GrepWithArgs
+
+function BuildPacks {
+  until buildpacks=$(cf app $app 2>/dev/null | grep -ie "buildpacks" | tr -s ' ' | cut -d" " -f2- )
+    do sleep $retryWait
+  done
+  printf "$app\t$buildpacks\n"
+}; export -f BuildPacks
+
+function AllRecentCrashEvents {
+cf curl "/v2/events?order-direction=desc&q=type:app.crash"
+}; export -f AllRecentCrashEvents
+
+function ListApps {
+  cf apps | GrabFrom "name" $(if [ "$paramCommand" = "la" ]; then echo header; fi) | sort | GrepWithArgs "$1" "$2"
+}; export -f ListApps
+
+function ListAllApps {
+  for org in $(cf orgs | GrabFrom name); do
+    cf target -o $org > /dev/null
+    for space in $(cf spaces | GrabFrom name); do
+      echo "================================================================="
+      cf target -o $org -s $space
+      cf apps # ListApps "$1 found"
+    done
+  done
+}; export -f ListAllApps
+
+function ListInsts {
+  echo $app; cf app $app | GrabFrom ' *state' header
+}; export -f ListInsts
+
+function ListLogs {
+  printf "\n\n\n"; cf logs $app --recent
+}; export -f ListInsts
+
+function ListCrashedApps {
+  ListApps | grep -ie started -ie crashed | sort | tr "/" " " | awk '{if ($3!=$4) print $0}'
+}; export -f ListCrashedApps
+
+function RestartCrashedInstances {
+  for app in $(ListCrashedApps | awk '{print $1}'); do
+    cf app $app | sed -n '/^ *state/,$p' | sed '/^$/q' | tail -n +2 | \
+      awk -v app=$app '{ if($2="crashed") print "restart-app-instance "app" "substr($1,2)" | head -n1"}'
+  done | xargs -L1 -P0 -I{} bash -c "cf {}"
+}; export -f RestartCrashedInstances
+
+function GetAppString {
+  export appstring=$(ListApps $1 | tr "," " " | tr "/" " " | awk -v d=$denominator  '{routes=""; for (i=7; i<=NF; i++) routes=routes" "$i" "; if ($4/d <1) print $1" 1 "$4" "routes; else print $1" "int($4/d)" "$4" "routes}' ) || return 1
+}; export -f GetAppString
+
+function GetAppInfo {
+  if [[ ! -z $1 ]]; then export appString="$@"; fi
+  export app=$(echo $appstring | awk '{print $1}')
+  export concurrentInstances=$(echo $appstring | awk '{print $2}')
+  export totalInstances=$(echo $appstring | awk '{print $3}')
+  export url=$(echo $appstring | awk '{print $4}')
+  export routes=$(echo $appstring | tr -s ' ' | cut -d' ' -f 4-)
+  export guid=$(cf app $app --guid) || return 2
+  if [[ $debug = 1 ]]; then printf "app				$app
+concurrentInstances		$concurrentInstances
+totalInstances			$totalInstances
+url				$url
+routes				$routes
+guid				$guid\n"
+  fi
+}; export -f GetAppInfo
+
+function SplitUrl {
+  export hostname=$(echo $1 | cut -d'.' -f1)
+  export baseUrl=$(echo $1 | cut -d'.' -f2-)
+}; export -f SplitUrl
+
+function SimpleRestartAppInstance {
+  cf restart-app-instance $1 $2 | head -n1; PipeStatus=${PIPESTATUS[0]}
+  if [[ $PipeStatus -eq 141 ]] || [[ $PipeStatus -eq 0 ]]; then return 0; else return $PipeStatus; fi
+}; export -f SimpleRestartAppInstance
+
+function ListHealthInstanceBYOP {
+  path="$1"
+  curl https://${url}${path} -H "X-CF-APP-INSTANCE":"$guid:$2" -sfI --silent | head -n1 | grep "200 OK" >/dev/null && return 0 || return 1
+}; export -f ListHealthInstanceBYOP
+
+function ListHealthInstance {
+  for path in $healthCheckPaths; do
+    ListHealthInstanceBYOP $path $2 && echo "$app:$2 $healthyString" && return 0
+  done
+  echo "$app:$2 $unhealthyString"
+  return 1
+}; export -f ListHealthInstance
+
+function ListPropertiesInstance {
+  echo $app
+  curl -s https://$url/env -H "X-CF-APP-INSTANCE":"$guid:$2" -H "Content-Type: application/json" -X GET -H "$basicAuth" | jq -C . | GrepWithArgs "$3" "$4"
+}; export -f ListPropertiesInstance
+
+function UpdatePropertiesInstance {
+  printf "$(curl https://$url/env -H "X-CF-APP-INSTANCE":"$guid:$2" -X POST -d "$propertiesToUpdate" -H "$basicAuth" -s)\n"
+}; export -f UpdatePropertiesInstance
+
+function GrabFrom { # GrabFrom "StartLineMatch" [header]
+ sed -n "$(printf "/^$1/,\$p")" | sed '/^$/q' | if [ ! "$2" = "header" ]; then tail -n +2; else cat; fi
+}; export -f GrabFrom
+
+function RecentCrashEvents {
+  echo $app
+  cf events $app | GrabFrom 'time' header | grep -ie $(date +"%Y-%m-%d") -ie $(date -d "yesterday" '+%Y-%m-%d')
+}; export -f RecentCrashEvents
+
+function RestartAppInstance {
+  SetCfHome
+  cf app $app | GrabFrom ' *state' | awk '{print $1}' | grep -w "#$2" > /dev/null || return 1
+  until (SimpleRestartAppInstance $app $2); do echo "Failed to restart instance $2 of $app, retrying in $retryWait seconds"; sleep $retryWait; done
+  sleep $sleepTime
+  until (ListHealthInstance $app $2 | grep -e "$healthyString"); do
+    cf app $app | GrabFrom ' *state' | grep -w "#$2" | awk -v app=$app -v inst=$2 \
+      '{ if ($1=="#"inst && $2=="crashed") system ("cf restart-app-instance "app" "inst" | head -n1; sleep 180"); print $0 }' > /dev/null 2>&1
+    sleep $sleepTime
+  done
+  SetCfHome clean
+}; export -f RestartAppInstance
+
+function RefreshAppInstance {
+  cf app $app | GrabFrom ' *state' | awk '{print $1}' | grep -w "#$2" > /dev/null && \
+    curl -X POST https://$url/refresh -H "X-CF-APP-INSTANCE":"$guid:$2" \
+      -H "Authorization: bearer $authToken" && \
+        printf "\nRefreshed instance $2 of $1\n"
+}; export -f RefreshAppInstance
+
+function MatchingApps {
+  ListApps "$1" | awk '{print $1}'
+}; export -f MatchingApps
+
+function FirstInstance {
+  if [[ $1 -ge 0 ]] && [[ $1 =~ $numberRE ]]; then echo $1; else echo 0; fi
+}; export -f FirstInstance
+
+function LastInstance {
+  if [[ $1 -le $totalInstances ]] && [[ $1 =~ $numberRE ]]; then echo $1; else echo $(($totalInstances-1)); fi
+}; export -f LastInstance
+
+function ConcurrentInstances {
+  if [[ $1 = "-1" ]]; then echo 0
+    else if [[ $1 -gt 0 ]] && [[ $1 -le $concurrentInstances ]] && [[ $1 =~ $numberRE ]]; then
+      echo $1; else echo $concurrentInstances
+    fi
+  fi
+}; export -f ConcurrentInstances
+
+function RollingCommand {
+  if [[ $# -le 2 ]]; then
+    for inst in $(seq $(FirstInstance $2) $(LastInstance $3));
+      do echo $app $inst
+    done | xargs -L1 -P$(ConcurrentInstances $2) -I{} bash -c "$command {}"
+  fi
+  if [[ $# -le 4 ]] && [[ $2 =~ $numberRE ]] && [[ $3 =~ $numberRE ]]; then
+    for inst in $(seq $(FirstInstance $2) $(LastInstance $3));
+      do echo $app $inst
+    done | xargs -L1 -P$(ConcurrentInstances $4) -I{} bash -c "$command {}"
+  fi
+}; export -f RollingCommand
+
+function ListLibraries {
+  results=$(cf ssh $app -c "ls /app/BOOT-INF/lib 2>/dev/null" | GrepWithArgs "$1" "$2")
+  if [ -z "$1" ]; then printf "$app\n$results"; else printf "$app\t$results" | tr "\n" ","; printf "\n"; fi
+}; export -f ListLibraries
+
+function ListOlder {
+  cf app $app | GrabFrom ' *state' | awk -v app=$app -v rdate=$1 '{if ($3 < rdate) print app" "substr($1,2)" "$3}';
+}; export -f ListOlder
+
+function ListNewer {
+  cf app $app | GrabFrom ' *state' | awk -v app=$app -v rdate=$1 '{if ($3 > rdate) print app" "substr($1,2)" "$3}';
+}; export -f ListNewer
+
+function GetAuthToken {
+  functionCalledTime=$(date +%s)
+  if [[ $authTokenExpiresOn -le $functionCalledTime ]]; then
+  export authResponse=$(curl -s --location --request $authTokenMethod \
+"$authTokenURL?grant_type=client_credentials&client_id=$authTokenClientId&client_secret=$authTokenClientSecret&scope=$authTokenSecret")
+  export authToken=$(echo $authResponse | jq -r .access_token)
+  export authTokenExpiresIn=$(echo $authResponse | jq -r .expires_in)
+  export authTokenExpiresOn=$(date -d $functionCalledTime --date="$authTokenExpiresIn seconds" +%s)
+  fi
+}; export -f GetAuthToken
+
+function SimpleLog { printf "$(date) $1 $command $2\n"; }; export -f SimpleLog
+
+function CanaryPromote {
+  export command=ListHealthInstance
+  GetAppString $2; GetAppInfo
+  export appStringTemp=$appstring
+  export appTemp=$app
+  export totalInstancesTemp=$totalInstances
+  export routesTemp=$routes
+  export guidTemp=$guid
+  GetAppString $1; GetAppInfo
+  export appStringMain=$appstring
+  export appMain=$app
+  export totalInstancesMain=$totalInstances
+  export routesMain=$routes
+  export guidMain=$guid
+
+  if [[ -z $appTemp ]] || [[ -z $appMain ]]; then echo "Apps don't exist"; return 1; fi
+  if [[ ! $appTemp = $2 ]] || [[ ! $appMain = $1 ]]; then echo "Please use exact app names"; return 1; fi
+
+  read -p $"ARE YOU SURE YOU WANT TO REPLACE $appMain with $appTemp?!?!?!?!\n" areYouSure
+  if [[ ! $areYouSure =~ ^[Yy]$ ]]; then return 1; fi
+    echo "you chose to proceed"; #return 1
+
+  export guid=$guidTemp
+  export app=$appTemp
+  if (RollingCommand $app | grep "$unhealthyString"); then
+    echo $app $unhealthyString
+#    return 1
+  fi
+
+  if echo $appTemp | grep canary; then
+    export appTempNew=$(echo $appTemp | rev | cut -d"-" -f 2- | rev)
+  else export appTempNew=$appTemp
+  fi
+
+  if echo $appMain | grep venerable; then
+    export appMainOld=$appMain
+  else export appMainOld=$(echo $appMain-venerable)
+  fi
+
+  if [[ ! $appMain = $appMainOld ]]; then cf rename $appMain $appMainOld; fi
+  if [[ ! $appTemp = $appTempnew ]]; then cf rename $appTemp $appTempNew; fi
+  cf restage $appTempNew
+  cf scale $appTempNew -i $totalInstancesMain
+  for route in $routesMain; do
+    SplitUrl $route
+    cf map-route $appTempNew $baseUrl --hostname $hostname
+  done
+  for route in $routesTemp; do
+    if echo $route | grep canary; then
+      SplitUrl $route
+      cf unmap-route $appTempNew $baseUrl --hostname $hostname
+    fi
+  done
+#  sleep 30
+#  while RollingCommand $appTempNew | grep unhealthyString; do sleep 30; done
+
+
+#  exiting
+#    if canary scaled and healthy
+#      list both
+#      ask to scale down
+#      list both
+#      ask to stop
+#      list both
+#      ask to delete
+#
+
+}; export -f CanaryPromote
+
+function ApiEndpoint { # Used to select api endpoints from and add them to cfhosts file
+# ApiEndpoint [api.site1.example.org | site1 (if api.site1.example.org is in cfhosts file)] [add]
+# ApiEndpoint		lists all api endpoints in cfhosts file
+# Below two are interactive is more than one match is returned
+# ApiEndpoint xyz	returns api endpoints which match with the parameter
+# ApiEndpoint xyz add	adds the parameter to the cfhosts file
+# ApiEndpoint xyz ninja silent ninja mode, used internally
+cfhosts="$(if [ -f ${configHome}/cfhosts ]; then cat ${configHome}/cfhosts; else echo ''; fi)"
+if [ -z "$1" ]; then echo "$cfhosts"
+elif [ -n "$1" ]; then
+  cfapi="$(cat <(if ( ! echo "$cfhosts" | grep -ie "$1" > /dev/null); then echo "$1"; fi) \
+  <(echo "$cfhosts") | sort | uniq | grep -ie "$1")"
+  until( [ $(echo "$cfapi" | wc -l) == "1" ] && [ -n "$cfapi" ] ); do
+    printf "Please select target destination (or 0 to cancel):\n$(cat <(echo "$cfapi") -n)\n"
+    read apiLineNumber
+    if [ "$apiLineNumber" == "0" ]
+      then cfapi="cancel"
+      return 1
+    else
+     cfapi="$(sed -n ${apiLineNumber}p <(echo "$cfapi"))"
+     ApiEndpoint $(if [ -z "$cfapi" ]; then printf "$1"; else printf "$cfapi"; fi) ninja
+    fi
+  done
+  if [ "$2" == "add" ]; then printf "$cfhosts" | grep -ie "$cfapi" > /dev/null || echo "$cfapi" >> ${configHome}/cfhosts
+  elif [ ! "$2" == "ninja" ]; then
+    if [[ ! "$silent" = "silent" ]]; then echo -e "$cfapi"; fi
+  fi
+fi
+}; export -f ApiEndpoint
+
+function ProdCheck {
+  if [ -z $scriptable ]; then
+    if echo $spaces | grep -iqF -e prd -e prod; then
+    read -p "You selected a production space, are you sure? " -n 1 -r
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then exit 1; fi
+    fi
+  fi
+}; export -f ProdCheck
+
+function CfLogin { # CfLogin [silent] api.cfsite.org [cf-org] [cf-space] [sso-option]
+  if [[ "$1" = "silent" ]]; then export silent=silent; shift 1; fi
+  if [[ "$1" = "" ]] || [[ "$1" = '""' ]]; then shift 1; fi
+  ApiEndpoint "$(if [ -n "$1" ]; then echo "$1"; else echo "."; fi)"
+  if [ "$cfapi" == "cancel" ]; then return 1; fi
+  sso=''
+  silencer=''
+  loginCommand='cf login -a $cfapi -u $cfuser -p $cfpass $org $spc $sso $sslValidation'
+  org="$(if [ -n "$2" ]; then echo -n "-o $2"; elif [ ! "$paramCommand" == "l" ]; then echo -n "-o 0rg"; fi)"
+  spc="$(if [ -n "$3" ]; then echo -n "-s $3"; elif [ ! "$paramCommand" == "l" ]; then echo -n "-s 5pc"; fi)"
+  set +x
+  if [[ -f ${configHome}/.cfcreds ]] && [[ -z "${credChanged}" ]]; then
+    cfuser="$(cat ${configHome}/.cfcreds | awk '{print $1}')"
+    cfpass="$(cat ${configHome}/.cfcreds | awk '{print $2}')"
+  fi
+  if [[ -n "$1" ]] && ( echo "${ssoSites}" | grep -ie "$1" &> /dev/null ) || [[ "$4" = "sso" ]] || [[ "$4" = "--sso" ]]; then sso="--sso"; fi
+  if [ -z $cfuser ]; then printf "CloudFoundry Username: " 1>&2; read cfuser; credChanged+=1; fi
+  if [ -z $cfpass ]; then printf "CloudFoundry Password: " 1>&2; read -s cfpass; printf "\n" credChanged+=1; fi
+  if [[ "$silent" = "silent" ]] && [[ -z "$sso" ]]; then silencer='&> /dev/null'; fi
+  if (curl -s -o /dev/null -L -w ''%{http_code}'' ${0} ${cfapi} &> /dev/null); then
+    eval $loginCommand $silencer
+    until cf t | grep -ie "${cfapi}" &> /dev/null; do
+      credChanged+=1; cfuser=''; cfpass=''; CfLogin "$silent" "$cfapi" "$org" "$spc" "$sso"
+    done
+    if [[ -n "$credChanged" ]]; then echo "$cfuser $cfpass" > ${configHome}/.cfcreds; fi
+    ApiEndpoint $cfapi add
+  else
+    echo "$cfapi" seems to be an invalid API endpoint, please check the endpoint and connectivity to it then try again
+  fi
+  CheckDebug
+}; export -f CfLogin
+
+function CfToolsHelper { #CfToolsHelper ["dcs: as-g9 po wc ame1-g2 amw2-g2"] CF-Org CF-Space CMD(S)
+  if [ ${1:0:4} = 'dcs:' ]; then dcs="${1:4}"; orgs="$2"; spaces="$3"; shift 3
+  else orgs="$1"; spaces="$2"; shift 2
+  fi
+  if [[ $1 =~ "cf" ]] || [[ $1 =~ "cmd" ]]; then
+    cmd=$1; shift 1
+  else cmd="$(ps -p $$ -eo args | grep -e "$scriptName" | awk '{print $2}' | head -n1)"
+  fi
+
+  for cf in $(if [ -z "$dcs" ] && [ -f ${configHome}/cfhosts ]; then
+      cat ${configHome}/cfhosts; else echo "$dcs"; fi); do
+    for org in $orgs; do
+      for space in $spaces; do
+        CfLogin silent "$cf" $org $space
+          target=$(cf target | head -n1 | awk '{print $3}')
+          if [ -z  $scriptable ]; then printf "============================================================\n$target\t$org\t$space\n";
+	  fi
+          $cmd "$@"
+      done
+    done
+  done
+}; export -f CfToolsHelper
+
+function ToLower { # ToLower "mIxEd CaSe sTrInG"
+tr '[:upper:]' '[:lower:]' <<< "$1"
+}; export -f ToLower
+
+function ForAllIn { # ForAllIn [-od | -oo ] [-o ORG] [-s SPACE] [-d DC] [-x] [-i ITEM] COMMAND(S)
+local exact=''
+local headers=''
+originalParams="$@"
+PARAMS=""
+while (( "$#" )); do
+  case "$1" in
+    -od|--only-dcs)
+      local onlyDcs="true"; shift # ; echo onlyDcs:$onlyDcs
+      ;;
+    -oo|--only-orgs)
+      local onlyOrgs="true"; shift # ; echo onlyOrgs:$onlyOrgs
+      ;;
+    -o|--org)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+        orgs="$(ToLower "$2") $orgs"; shift 2 # ; echo orgs:$orgs
+      else echo "Error: Argument for $1 is missing" >&2; helptext; exit 1; fi
+      ;;
+    -s|--space)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+        spaces="$(ToLower "$2") $spaces"; shift 2 # ; echo spaces:$spaces
+      else echo "Error: Argument for $1 is missing" >&2; helptext; exit 1; fi
+      ;;
+    -d|--dc)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+        dcs="$(ToLower "$2") $dcs"; shift 2 # ; echo dcs:$dcs
+      else echo "Error: Argument for $1 is missing" >&2; helptext; exit 1; fi
+      ;;
+    -O|--exclude-org)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+        ORGS="$(ToLower "$2") $ORGS"; shift 2 # ; echo ORGS:$ORGS
+      else echo "Error: Argument for $1 is missing" >&2; helptext; exit 1; fi
+      ;;
+    -S|--exclude-space)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+        SPACES="$(ToLower "$2") $SPACES"; shift 2 # ; echo SPACES:$SPACES
+      else echo "Error: Argument for $1 is missing" >&2; helptext; exit 1; fi
+      ;;
+    -D|--exclude-dc)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+        DCS="$(ToLower "$2") $DCS"; shift 2 # ; echo DCS:$DCS
+      else echo "Error: Argument for $1 is missing" >&2; helptext; exit 1; fi
+      ;;
+    -x|--exact-match)
+      exact='$'; shift # ; echo exact:$exact
+      ;;
+    -c|--concurrent) # execute concurrently, not implemented due to possible collisions
+      concurrent='&'; shift # ; echo concurrent:$concurrent
+      ;;
+    -h|--headers) # List the org/space before command output
+      headers='true'; shift # ; echo concurrent:$concurrent
+      ;;
+    -i|--item)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+        items="$(ToLower "$2") $items"; shift 2 # ; echo items:$items
+      else echo "Error: Argument for $1 is missing" >&2; helptext; exit 1; fi
+      ;;
+    *)
+      PARAMS="$PARAMS $1"; shift 1 # ; echo PARAMS:$PARAMS
+  esac
+done
+eval set -- "$PARAMS" # set positional arguments in their proper place
+
+for api in $(ToLower "$(ApiEndpoint) $dcs" | tr -s ' ' | tr ' ' '\n' | sort | uniq); do # echo api:$api
+  if [ -z "$dcs" ] || \
+  ( for i in $dcs; do echo "$api" | grep -ie "${i}${exact}" > /dev/null && break; done ) && \
+  ( echo "$DCS" | grep -vie "$api" > /dev/null ); then
+    CfLogin silent $api 1>&2; export api; else continue; fi
+  if [ "$onlyDcs" = "true" ]; then export org="null"; export space="null"
+    [ -n "$headers" ] && echo "${api}"
+    eval "$@"; continue
+  fi
+  for org in $(cf orgs | GrabFrom name$exact); do # echo org:$org
+    if [ -z "$orgs" ] || \
+     ( for i in $orgs; do echo "$org" | grep -ie "${i}${exact}" > /dev/null && break; done ) && \
+     ( echo "$ORGS" | grep -vie "$org" > /dev/null ); then
+      cf target -o$org > /dev/null; export org; else continue; fi
+    if [ "$onlyOrgs" = "true" ]; then export space="null"
+      [ -n "$headers" ] && echo "${api}/${org}"
+      eval "$@"; continue
+    fi
+    for space in $(cf spaces | GrabFrom name$exact); do # echo space:$space
+      if [ -z "$spaces" ] || \
+       ( for i in $spaces; do echo "$space" | grep -ie "${i}${exact}" > /dev/null && break; done ) && \
+       ( echo "$SPACES" | grep -vie "$space" > /dev/null ); then
+        cf target -s$space > /dev/null; export space; else continue; fi
+      if [ -n "$items" ]; then for item in $items; do # echo item:$item
+        [ -n "$headers" ] && echo "${api}/${org}/${space}"
+        for i in $(cf ${item}s | GrabFrom name$exact | awk '{print $1}'); do # echo i:$i
+          [ -n "$headers" ] && echo "${item}"; eval "$@" # $concurrent
+        done # i
+      done # item
+      else [ -n "$headers" ] && echo "${api}/${org}/${space}"; eval "$@" # $concurrent
+      fi # items
+    done # space
+  done # org
+done # api
+}; export -f ForAllIn
+
+function ServiceAudit {
+theCommand="$(cat << ENDOFHEREFILE
+'printf "\$api\t\$org\t\$space\t\$i\t\$(cf service \$i --guid)\n"'
+ENDOFHEREFILE
+)"
+ForAllIn -i service "$theCommand"
+}; export -f ServiceAudit
+
+function UserAccessAudit {
+UserAccessAuditOrgs "$@"
+UserAccessAuditSpaces "$@"
+}; export -f UserAccessAudit
+
+function UserAccessAuditOrgs {
+theCommand="$(cat << ENDOFHEREFILE
+originalIFS="\$IFS"; IFS=''
+cf org-users \$org | tail -n +3 | while read line; do
+  if [[ "\${line:0:2}" != "  " ]]; then role=\$line; continue; fi
+  printf "\$api\\t\$org\\t\$space\\t\${line:2}\t\$role\\n"
+done
+export IFS=\$originalIFS
+ENDOFHEREFILE
+)"
+echo "$theCommand" | tr -d '\r' > ${tmpFolder}/./tmpCmd$$ && chmod +x ${tmpFolder}/./tmpCmd$$
+ForAllIn -oo "$@" '\${tmpFolder}/./tmpCmd$$' ; rm -rf ${tmpFolder}/./tmpCmd$$
+}; export -f UserAccessAuditOrgs
+
+function UserAccessAuditSpaces {
+theCommand="$(cat << ENDOFHEREFILE
+originalIFS="\$IFS"; IFS=''
+cf space-users \$org \$space | tail -n +3 | while read line; do
+  if [[ "\${line:0:2}" != "  " ]]; then role=\$line; continue; fi
+  printf "\$api\\t\$org\\t\$space\\t\${line:2}\t\$role\\n"
+done
+export IFS=\$originalIFS
+ENDOFHEREFILE
+)"
+echo "$theCommand" | tr -d '\r' >${tmpFolder}/./tmpCmd$$ && chmod +x ${tmpFolder}/./tmpCmd$$
+ForAllIn "$@" '\${tmpFolder}/./tmpCmd$$' ; rm -rf ${tmpFolder}/./tmpCmd$$
+}; export -f UserAccessAuditSpaces
+
+function Inventory {
+theCommand="$(cat << ENDOFHEREFILE
+cf apps | GrabFrom name | awk -v api=\${api} -v org=\${org} -v space=\${space} '{print api","org","space"," \$1","\$2","\$3","\$4","\$6\$7\$8\$9}'
+ENDOFHEREFILE
+)"
+echo "$theCommand" | tr -d '\r' >${tmpFolder}/./tmpCmd$$ && chmod +x ${tmpFolder}/./tmpCmd$$
+printf "CF-Site,CF-Org,CF-Space,App-Name,Instances,Memory,Disk,Routes\n"
+ForAllIn "$@" '\${tmpFolder}/./tmpCmd$$' ; rm -rf ${tmpFolder}/./tmpCmd$$
+}; export -f Inventory
+
+function Overview {
+theCommand="$(cat << ENDOFHEREFILE
+cf spaces | GrabFrom name | awk -v api=\${api} -v org=\${org} -v space=\${space} '{print api","org","\$1}'
+ENDOFHEREFILE
+)"
+ForAllIn -oo "$@" "\$theCommand"
+# echo "$theCommand" | tr -d '\r' >${tmpFolder}/./tmpCmd$$ && chmod +x ${tmpFolder}/./tmpCmd$$
+#ForAllIn -oo "$@" '\${tmpFolder}/./tmpCmd$$' | PrettyXSV c; rm -rf ${tmpFolder}/./tmpCmd$$
+}; export -f Overview
+
+function GrantUserAccess { # o O s d i
+originalParams="$@"
+PARAMS=""
+while (( "$#" )); do
+  case "$1" in
+    -u|--user)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+        export users=$(ToLower "$2 $users"); shift 2 # ; echo users:$users
+      else echo "Error: Argument for $1 is missing" >&2; helptext; exit 1; fi
+      ;;
+    -r|--role)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+        export roles=$(ToLower "$2 $roles"); shift 2 # ; echo roles:$roles
+      else echo "Error: Argument for $1 is missing" >&2; helptext; exit 1; fi
+      ;;
+    *)
+      PARAMS="$PARAMS $1"; shift 1 # ; echo PARAMS:$PARAMS
+  esac
+done
+eval set -- "$PARAMS" # set positional arguments in their proper place
+
+theCommand="$( cat << ENDOFHEREFILE
+if [ -n "\$debug" ]; then set -x; fi
+if (echo "\$roles" | grep -ie "Space" > /dev/null ); then
+#  spaces=\$(cf spaces | sed -n "/^name/,\\\$p" | tail -n+2)
+  spaces=\$(cf spaces | GrabFrom name)
+else spaces='null'; fi
+for space in \$spaces; do # echo \$space
+  for role in \$roles; do # echo \$role
+    for user in \$users; do # echo \$user
+      if (echo "\$role" | grep -ie "^Org" -ie "^BillingManager" > /dev/null ); then
+        eval cf set-org-role \$user \$org \$role
+      else
+	eval cf set-space-role \$user \$org \$space \$role
+      fi
+    done # user
+  done # role
+done # space
+set +x
+ENDOFHEREFILE
+)"
+
+  echo "$theCommand" | tr -d '\r' >${tmpFolder}/./tmpCmd$$&& chmod +x ${tmpFolder}/./tmpCmd$$
+  ForAllIn -oo "$@" '\${tmpFolder}/./tmpCmd$$'; rm -rf ${tmpFolder}/./tmpCmd$$ ${tmpFolder}/tmpCmdTmp$$
+}; export -f GrantUserAccess
+
+function PrettyXSV {
+if [ "$1" = "t" ]; then local x="\$'\\t'"; shift
+elif [ "$1" = "c" ]; then local x=","; shift; fi
+column -t -s$x -n "$@"
+}; export -f PrettyXSV
+
+function CheckDebug { if [[ "$debug" = 1 ]]; then set -x; fi }; export -f CheckDebug
+
+if [[ $# -lt 1 ]]; then helptext; fin; else SetCfHome; fi
+CheckDebug
+
+# First conditional to parse parameter(s)
+if [[ $paramCommand = "d" ]]; then set -x; shift 1; export debug=1; export paramCommand=$1; fi
+
+
+# Begin add-ons
+if [[ $paramCommand = "l" ]]; then shift 1; SetCfHome clean; CfLogin "$@"; fin; fi # export finished=yes; fi # the old cfl
+if [[ $paramCommand = "h" ]]; then shift 1; CfToolsHelper "$@"; fin; fi # the old cftoolshelper
+if [[ $paramCommand = "i" ]]; then shift 1; Inventory "$@"; fin; fi # csv of basic app info
+if [[ $paramCommand = "sa" ]]; then shift 1; ServiceAudit "$@"; fin; fi # tsv of services and their guids
+if [[ $paramCommand = "ae" ]]; then shift 1; ApiEndpoint "$@"; fin; fi
+if [[ $paramCommand = "fai" ]]; then shift 1; ForAllIn "$@"; fin; fi # itterate over all orgs, spaces, and items (apps or services)
+if [[ $paramCommand = "uaa" ]]; then shift 1; UserAccessAudit "$@"; fin; fi # tsv of all users and thier roles
+if [[ $paramCommand = "gua" ]]; then shift 1; GrantUserAccess "$@"; fin; fi # grant user(s) access across multiple sites/orgs/envs
+if [[ $paramCommand = "ls" ]]; then shift 1; Overview "$@"; fin; fi # csv of site,org,space
+# End add-ons
+
+if [[ $paramCommand = "rr"  ]] || \
+   [[ $paramCommand = "rai" ]] || \
+   [[ $paramCommand = "rf"  ]] || \
+   [[ $paramCommand = "rfi" ]] || \
+   [[ $paramCommand = "rc"  ]] || \
+   [[ $paramCommand = "upi" ]] || \
+   [[ $paramCommand = "cp" ]] && [[ $isAdmin -lt 1 ]]; then
+	echo "Admin command detected, please set the admin level before retrying"
+	shift $#; fin
+fi
+
+if [[ $paramCommand = "rr" ]] || [[ $paramCommand = "rai" ]]; then command=RestartAppInstance; denominator=$restartDenominator; fi
+if [[ $paramCommand = "rf" ]] || [[ $paramCommand = "rfi" ]]; then command=RefreshAppInstance; denominator=$refreshDenominator; GetAuthToken; fi
+if [[ $paramCommand = "lh" ]] || [[ $paramCommand = "lhi" ]]; then command=ListHealthInstance; denominator=$refreshDenominator; fi
+if [[ $paramCommand = "lp" ]] || [[ $paramCommand = "lpi" ]]; then command=ListPropertiesInstance; denominator=$refreshDenominator; fi
+if [[ $paramCommand = "up" ]] || [[ $paramCommand = "upi" ]]; then command=UpdatePropertiesInstance; denominator=$refreshDenominator; fi
+
+if [[ $paramCommand = "kill" ]]; then ps aux | GrepWithArgs "${scriptName} RefreshAppInstance RestartAppInstance" | awk '{print $2}' | xargs -L1 kill; fin; fi
+if [[ $paramCommand = "status" ]]; then ps aux | GrepWithArgs "${scriptName} RefreshAppInstance RestartAppInstance" | grep -v grep; fin; fi
+if [[ $paramCommand = "rai" ]] || [[ $paramCommand = "rfi" ]] || [[ $paramCommand = "lhi" ]] || [[ $paramCommand = "lpi" ]] || [[ $paramCommand = "upi" ]] && [[ $3 =~ $numberRE ]]; then
+	SimpleLog Starting "$2 $3 $4 $5 $6"; for app in $(MatchingApps "$2"); do
+		GetAppString $app; GetAppInfo; $command $app "$3" "$4" "$5"
+	done; SimpleLog Finished "$2 $3 $4 $5 $6"; fin
+fi
+
+if [[ $paramCommand = "rr" ]] || [[ $paramCommand = "rf" ]] || [[ $paramCommand = "lh" ]] || [[ $paramCommand = "lp" ]] || [[ $paramCommand = "up" ]] && [[ $# -ge 2 ]]; then
+	if [[ $paramCommand = "lp" ]]; then property="$3"; matchingApps="$2"; fi
+	SimpleLog Starting "$2 $3 $4 $5 $6"; for app in $(MatchingApps "$2"); do
+		GetAppString $app; GetAppInfo; RollingCommand $app  $3 $4 $5
+	done; SimpleLog Finished "$2 $3 $4 $5 $6"; fin
+fi
+
+if [[ $paramCommand = "laa" ]]; then ListAllApps "$2"; fin; fi
+if [[ $paramCommand = "la" ]]; then ListApps "$2"; fin; fi
+if [[ $paramCommand = "li" ]]; then for app in $(MatchingApps "$2"); do until (ListInsts); do sleep $retryWait; done; done; fin; fi
+if [[ $paramCommand = "lc" ]]; then ListCrashedApps; fin; fi
+if [[ $paramCommand = "ll" ]]; then for app in $(MatchingApps "$2"); do ListLogs; done; fin; fi
+if [[ $paramCommand = "lb" ]]; then for app in $(MatchingApps "$2"); do ListLibraries "$3" "$4" "$5"; done; fin; fi
+if [[ $paramCommand = "bp" ]]; then for app in $(MatchingApps "$2"); do BuildPacks; done | column -t; fin; fi
+if [[ $paramCommand = "rc" ]]; then RestartCrashedInstances; fin; fi
+if [[ $paramCommand = "rce" ]]; then for app in $(MatchingApps "$2"); do RecentCrashEvents; done; fin; fi
+if [[ $paramCommand = "cp" ]] && [[ $isAdmin -gt 9 ]]; then CanaryPromote $2 $3; fin; fi
+if [[ $paramCommand = "lo" ]]; then for app in $(MatchingApps "$2"); do ListOlder "$3"; done; fin; fi
+if [[ $paramCommand = "ln" ]]; then for app in $(MatchingApps "$2"); do ListNewer "$3"; done; fin; fi
+if [[ $paramCommand = "arce" ]]; then AllRecentCrashEvents; fin; fi
+if [[ $paramCommand = "clean" ]]; then SetCfHome clean; rm -rf $cfTmpHome/* ; fin; fi
+
+if [[ $paramCommand = "info" ]]; then export debug=1; for app in $(MatchingApps "$2"); do printf $'=============\n'; GetAppString $app; GetAppInfo; done; fin; fi
+
+if [ -z "$finished" ]; then helptext; fi
