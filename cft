@@ -42,51 +42,144 @@ fi
 
 
 function helptext { # leverages cat and here-document to display man page
-cat <<HELP
-Cloud Foundry Tools
-./$scriptName COMMAND [ARG1 ARG2 ARG3...]
-Commands: info, clean, d (debug), lc (list crashed), lh (list health), lhi (list instance health), rc (restart crashed), rce (recent crash events), bp (buildpacks), lp (list properties), lpi (list instance properties), lo (list older), ln (list newer), ll (list logs), sa (service audit), uaa (user access audit), i (inventory), fai (for all in)
-Rampage/Status:			$scriptName kill/status
-Debug (Dial up verbosity):	$scriptName d parameter[s]
-List All (or subset):		$scriptName la [APPNAME]
-List Instance information:	$scriptName li [APPNAME]
-List Logs:			$scriptName ll [APPNAME]
-List Properties:		$scriptName lp [APPNAME] [MATCH] [GREPARGS]
-List Buildpacks:		$scriptName bp [APPNAME]
-Recent Crash Events:		$scriptName rce [APPNAME]
-List Older:                     $scriptName lo [APPNAME] YYYY-MM-DDTHH:MM:SSZ
-List Newer:                     $scriptName ln [APPNAME] YYYY-MM-DDTHH:MM:SSZ
-All Recent Crash Events:	$scriptName arce
-List Libraries			$scriptName lb [APPNAME] [LIBRARY] [GREPARGS]
-Restart/Refresh App Instance:	$scriptName rai/rfi/lhi/lpi APPNAME INST [SEARCHCRITERIA]
-Rolling Restart/Refresh:	$scriptName rr/rf/lh/lp APPNAME
-Rolling Restart/Refresh:	$scriptName rr/rf/lh/lp APPNAME INSTCOUNT
-Rolling Restart/Refresh:	$scriptName rr/rf/lh/lp APPNAME FIRSTINST LASTINST
-Rolling Restart/Refresh:	$scriptName rr/rf/lh/lp APPNAME FIRSTINST LASTINST INSTCOUNT
-
-APPNAME may be replaced with a quoted space deliminated list of app names. A period [.] may be used as a wildcard for APPNAME.
-Using a "d" as the first argument will enable "Debug mode" and dial up the verbosity.
-Use -1 to unleash unlimited concurrent instances
-
-Cloud Foundry Login
-Login to cf site and upon success add the site to cfhosts config file. May use partial matches as shortcuts, passing anything as a 4th parameter will enable sso-login along with any sites set in the ssoSites space deliminated variable.
-$scriptName l api.cfsite.org [cf-org] [cf-space] [sso-option]
-
-For All In
-Iterate through all sites, orgs, spaces, and optionally items (apps, services) running a command or executing a script against each.
-$scriptName fai [-d datacenter] [-o org] [-s site] [-i app | -i service] cf ...
-
-Grant User Access
-Iterate through all sites, orgs, and optionally spaces granting users the defines roles.
-$scriptName gua [-d datacenter] [-o org] -u username1 -r RoleName1 -u username2 -r rolename2 ... 
-
-Cloud Foundry Tools Helper
-Runs the Cloud Foundry Tool against multiple datacenters, may also be used to run cf cli or generic commands/scripts, predecessor to "For All In".
-$scriptName h ["dcs:as-g9 po wc ame1-g1 amw2-g1"] "ORGS1 ORG2 ..." "SPACE1 SPACE2 ..." CFTOOLSARGS
-$scriptName h ["dcs:as-g9 po wc ame1-g1 amw2-g1"] "ORGS1 ORG2 ..." "SPACE1 SPACE2 ..." cf CFCLIARGS
-$scriptName h ["dcs:as-g9 po wc ame1-g1 amw2-g1"] "ORGS1 ORG2 ..." "SPACE1 SPACE2 ..." cmd CMDS
-
+less -f <(cat <<HELP
+NAME
+ cft - CloudFoundry Tools - https://github.com/ardyhash/rdscripts
+DESCRIPTION
+ cft is a Cloudfoundry CLI helper script designed to reduce the number of
+ keystrokes required to perform administrative and DevOps duties accross
+ multiple cloudfoundry installations. Originally designed to perform rolling
+ restarts of application instances, it's modular nature and real life needs
+ have evolved it into a swiss army knife like tool packing numerious audit,
+ administrative, and development functionalities.
+SYNOPSIS
+ cft [d] COMMAND [ APPNAME ] [ARG1 ] [ OPTIONS ] [ ARG2 ] ...
+ 
+-APPNAME may be replaced with a quoted space deliminated list of app names.
+ A period [.] may be used as a wildcard for APPNAME. Will make partial match.
+-COMMANDS
+ d	- Debug by increasing verbosity and output
+ l	- Login to a Cloudfoundry site
+ h	- Helper: Legacy cftoolshelper functionality, use fai instead
+ i	- Inventory basic application information to csv output
+ ls	- List sites, orgs, and spaces to csv output
+ sa	- Service Audit: Output a tsv of services and their guids
+ fai	- For All In: Iterate over all sites, orgs, spaces, and optionally
+          apps and services
+ uaa	- User Access Audit: Dump all users and associations to screen (tsv)
+ gua	- Grant User Access: Grant user(s) roles, leverages fai internally
+ rr	- Rolling Restart: Rolling restart instances of application(s)
+ rai	- Restart Application Instance: Restart instance of an application
+ rf	- Rolling reFresh: instances of an application (to pickup properties)
+ rfi	- ReFresh Instance: of an application (to test new properties)
+ rc	- Restart Crashed instances of applications
+ up	- Update Properties of all application instances
+ upi	- Update Properties Instance: Update properties of one app instance
+ lh	- List Health of all instances of an application
+ lhi	- List Health Instance of application
+ lp	- List Properties of all instances of application (noisy)
+ lpi	- List Properties Instance of application
+ status	- List running processes
+ kill	- Kill running processes
+ laa	- List All Apps
+ la	- List Apps
+ li	- List Instances
+ lc	- List Crashed applications
+ ll	- List Logs
+ lb	- List liBraries
+ rce	- Recent Crash Events
+ lo	- List Older
+ ln	- List Newer
+ arce	- All Recent Crash Events
+ clean	- Clean cfhome temporary config root (will affect running instances)
+ farev	- Find And Replace Environment Variable
+ info	- Information: Used during writing/debugging of this script
+-OPTIONS
+ -od --only-dcs
+  Target only Cloudfoundry sites (DCs or Instances) when iterating  
+ -oo --only-orgs
+  Target only sites and orgs when iterating (do not step down into spaces)
+ -o --org
+  Target only the orgs which are passed via the -o ORG parameters
+ -s --space
+  Target only the spaces which are passed via the -s SPACE parameters
+ -d --dc
+  Target only the sites (DCs or Instances) passed via -d DC parameters
+ -O --exclude-org
+  Do not target the orgs passed via -O ORG
+ -S --exclude-space
+  Do not target the spaces passed via -S Space
+ -D --exclude-dc
+  Do not target the sites (DCs or Instances) pased via the -D DC parameters
+ -x --exact-match
+ -u --user
+  Username(s) of users for which bulk actions will take place
+ -r --role
+  Role(s) on which bulk actions will take place  
+ Use -1 for instance count to unleash unlimited concurrent instances
+EXAMPLES
+ Rampage/Status:			$scriptName kill/status
+ Debug (Dial up verbosity):	$scriptName d parameter[s]
+ List All (or subset):		$scriptName la [APPNAME]
+ List Instance information:	$scriptName li [APPNAME]
+ List Logs:			$scriptName ll [APPNAME]
+ List Properties:		$scriptName lp [APPNAME] [MATCH] [GREPARGS]
+ List Buildpacks:		$scriptName bp [APPNAME]
+ Recent Crash Events:		$scriptName rce [APPNAME]
+ List Older:                     $scriptName lo [APPNAME] YYYY-MM-DDTHH:MM:SSZ
+ List Newer:                     $scriptName ln [APPNAME] YYYY-MM-DDTHH:MM:SSZ
+ All Recent Crash Events:	$scriptName arce
+ List Libraries			$scriptName lb [APPNAME] [LIBRARY] [GREPARGS]
+ Restart/Refresh App Instance:	$scriptName rai/rfi/lhi/lpi APPNAME INST [SEARCHCRITERIA]
+ Rolling Restart/Refresh:	$scriptName rr/rf/lh/lp APPNAME
+ Rolling Restart/Refresh:	$scriptName rr/rf/lh/lp APPNAME INSTCOUNT
+ Rolling Restart/Refresh:	$scriptName rr/rf/lh/lp APPNAME FIRSTINST LASTINST
+ Rolling Restart/Refresh:	$scriptName rr/rf/lh/lp APPNAME FIRSTINST LASTINST INSTCOUNT
+ - Cloud Foundry Login
+  Login to cf site and upon success add the site to cfhosts config file. May
+  use partial matches as shortcuts, passing anything as a 4th parameter will
+  enable sso-login along with any sites set in the ssoSites space deliminated
+  variable.
+  
+  $scriptName l api.cfsite.org [cf-org] [cf-space] [sso-option]
+ - For All In
+  Iterate through all sites, orgs, spaces, and optionally items
+  (apps, services) running a command or executing a script against each.
+  
+  $scriptName fai [-d datacenter] [-o org] [-s site] [-i app | -i service] CMDS
+ - Grant User Access
+  Iterate through all sites, orgs, and optionally spaces granting roles to users.
+  
+  $scriptName gua [-d datacenter] [-o org] -u username1 -r RoleName1 -u username2 -r rolename2 ... 
+ - Cloud Foundry Tools Helper (No longer maintained, use For All In instead)
+  Runs the Cloud Foundry Tool against multiple datacenters, may also be used to
+  run cf cli or generic commands/scripts, predecessor to "For All In".
+  
+  $scriptName h ["dcs:as-g9 po wc ame1-g1 amw2-g1"] "ORGS1 ORG2 ..." "SPACE1 SPACE2 ..." CFTOOLSARGS
+  $scriptName h ["dcs:as-g9 po wc ame1-g1 amw2-g1"] "ORGS1 ORG2 ..." "SPACE1 SPACE2 ..." cf CFCLIARGS
+  $scriptName h ["dcs:as-g9 po wc ame1-g1 amw2-g1"] "ORGS1 ORG2 ..." "SPACE1 SPACE2 ..." cmd CMDS
+  
+FILES
+ cft
+  The main script, place it in your PATH for convenience
+ 
+ ~/.rdscripts/*
+  Location where configuration is kept
+ENVIRONMENT
+ Script requires a standard Bash environment with CF commandline installed and
+ in the path. Additionally, standard bash utilities like curl, sed, awk, tr,
+ cut and others are required for most functionality and some nonstandard tools
+ like jq and others are required for some functionality.
+DIAGNOSTICS
+ d may be passed as the first argument to run the script in debug mode.
+BUGS
+ Please report bugs via github..
+AUTHOR
+ https://github.com/ardyhash/rdscripts
+SEE ALSO
+ cf (Cloud Foundry CLI), bash, sed, awk, cat, jq
 HELP
+)
 }
 
 function fin { SetCfHome clean; export finished=yes; }; export -f fin
@@ -188,7 +281,9 @@ function SimpleRestartAppInstance {
 
 function ListHealthInstanceBYOP {
   path="$1"
-  curl https://${url}${path} -H "X-CF-APP-INSTANCE":"$guid:$2" -sfI --silent | head -n1 | grep "200 OK" >/dev/null && return 0 || return 1
+  curl https://${url}${path} -H "X-CF-APP-INSTANCE":"$guid:$2" -sfI --silent | head -n1 | grep "200 OK" >/dev/null && return 0 \
+  || curl https://${url}${path} -H "X-CF-APP-INSTANCE":"$guid:$2" -sfI --silent | head -n1 | grep "401" >/dev/null && return 0 \
+  || return 1
 }; export -f ListHealthInstanceBYOP
 
 function ListHealthInstance {
@@ -398,8 +493,7 @@ fi
 function ProdCheck {
   if [ -z $scriptable ]; then
     if echo $spaces | grep -iqF -e prd -e prod; then
-    read -p "You selected a production space, are you sure? " -n 1 -r
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then exit 1; fi
+    Confirm "You selected a production space, are you sure? " || exit 1
     fi
   fi
 }; export -f ProdCheck
@@ -675,6 +769,34 @@ elif [ "$1" = "c" ]; then local x=","; shift; fi
 column -t -s$x -n "$@"
 }; export -f PrettyXSV
 
+function Confirm { # Confirm "Confirmation text to be displayed"
+  if [ -z $scriptable ]; then
+    local thisReply=''
+    confirmationText="$([ -z "$1" ] && printf "Are you sure you wish to proceed? (y or Y to confirm)" || printf "$1")"
+    read -p "$confirmationText " -n 1 -r -t 30 thisReply; printf "\n"
+    if [[ ! $thisReply =~ ^[Yy]$ ]]; then return 1; fi
+  fi
+}; export -f Confirm
+
+function FindAndReplaceEnvVar { # FindAndReplaceEnvVar AppName FindThisString ReplaceWithThisString
+replacements="$(cf env $1 | grep -ie $2)"
+originalIFS="$IFS"; IFS=''
+for replacement in "$replacements"; do
+  keyName="$(echo "$replacement" | awk '{print $1}' | rev | cut -d':' -f2- | rev)"
+  originalValue="$(echo "$replacement" | awk '{print $2}')"
+  newValue="$(echo "$originalValue" | sed "s/$2/$3/g")"
+  if [ -z "$keyName" ] || [ -z "$newValue" ]; then continue; fi
+  thisCommand="cf set-env $1 $keyName $newValue";
+  if Confirm "$(printf "Enter Y or y if you wish to continue performing the following command\n$thisCommand\n")"; then
+    eval $thisCommand
+    thisCommand="cf restage $1"
+    Confirm "Enter Y or y if you wish to continue restaging using the following command:\n$thisCommand\n" \
+    && Confirm "Restaging will cause the application to go down, are you sure? " && eval $thisCommand
+  fi
+done
+export IFS=$originalIFS
+}; export -f FindAndReplaceEnvVar
+
 function CheckDebug { if [[ "$debug" = 1 ]]; then set -x; fi }; export -f CheckDebug
 
 if [[ $# -lt 1 ]]; then helptext; fin; else SetCfHome; fi
@@ -742,6 +864,7 @@ if [[ $paramCommand = "lo" ]]; then for app in $(MatchingApps "$2"); do ListOlde
 if [[ $paramCommand = "ln" ]]; then for app in $(MatchingApps "$2"); do ListNewer "$3"; done; fin; fi
 if [[ $paramCommand = "arce" ]]; then AllRecentCrashEvents; fin; fi
 if [[ $paramCommand = "clean" ]]; then SetCfHome clean; rm -rf $cfTmpHome/* ; fin; fi
+if [[ $paramCommand = "farev" ]]; then for app in $(MatchingApps "$2"); do FindAndReplaceEnvVar $app "$3" "$4"; done; fin; fi
 
 if [[ $paramCommand = "info" ]]; then export debug=1; for app in $(MatchingApps "$2"); do printf $'=============\n'; GetAppString $app; GetAppInfo; done; fin; fi
 
