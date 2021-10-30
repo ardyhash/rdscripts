@@ -1,0 +1,306 @@
+#!/bin/bash
+# Service Swap Script
+
+retryWaitSeconds=60
+parallelOperations=1
+timeBetweenOperations=10
+timeStamp=$(date +"%m%d%Y%H%M%S")
+inlineServices=""
+declare -A serviceDetails
+
+# Following may be passed via parameter
+
+services="My_Redis My_RabbitMQ"
+operations="unbind renameAndRecreate bind scaledown restage scaleup"
+validOperations="unbind renameAndRecreate bind scaledown restage scaleup delete debug rebind validate"
+
+# Following may be placed in a config file, the name of which may be passed via parameter
+# Define redis vars
+service=My_Redis
+serviceDetails[$service,newService]=c-redis
+serviceDetails[$service,newPlan]=dedicated-cache
+
+# Define rabbitmq vars
+service=My_RabbitMQ
+serviceDetails[$service,newService]=c-rabbitmq
+serviceDetails[$service,newPlan]=dedicated
+
+# Following are only used within the script, defined here for scoping purposes
+invalidOperations=""
+appList=""
+
+function helptext {
+cat <<HELP
+NAME
+ sss - Service Swap Script
+SYNOPSIS
+ sss [-c config-file] [-a application1] [-a application2] [-o "operation1 operation2 ..."] [-s "service1 service2 ..."]
+DESCRIPTION
+ In order to help expedite the changing of services in cloudfoundry we may use the script Service Swap Script, henceforth
+ referred to by its acronym: sss. The script has been written to be modular such that it may be used for performing some,
+ many, or all operations required against all services or a select subset thereof.
+OPTIONS
+ -a --application-name
+  This option may be used multiple times if there are multiple applications to be considered
+ -o --operations
+  Space separated list of operations encapsulated within quotation marks. The by default, with the exceptions of
+  debug and delete all operations are considered:
+  unbind            - unbind the application from the service
+  renameAndRecreate - rename the service instance and upon success recreate the new service instance with the old name
+  bind              - bind the application to the service instance with original name
+  rebind            - rebind, used to unbind and rebind apps which had failed to bind
+  scaledown         - scale down the application to a single instance
+  restage           - restage the application to ensure it is using the latest service instance
+  scaleup           - scale up the application to the original number
+  delete            - delete the original service instance which has been renamed
+  validate          - generate a table of apps and service instances to validate
+  debug             - only used for troubleshooting the script
+ -s --services
+  Space separated list of services encapsulated within quotation marks. Each service should have a variable array as denoted
+  in the config-file. "any" will perform operation(s) on any application regardless of service bindings
+  
+ -p --parallel-operations
+  The number of operations to perform in parallel, this makes the output a bit difficult to read but can help in saving time.
+  Only applies to scaling and restaging operations as the bind and unbind operations require delays.
+  
+ -i --inline-definition
+  Inline definition of a service, when used it will override the -s (--services) option, though -c (--config-file) will
+  override inline-definitions if the parameter is passed after. See below for format and example:
+  sss -i ServiceInstanceName MarketplaceServiceName MarketplaceServicePlan
+  sss --inline-definition MyRedis c-redis dedicated
+  
+ -c --config-file
+  Config file used for overriding the config in the script or adding additional configuration without modifying the script.
+  Configuration file example can include operations, services, and service variable blocks:
+  services="MyRedis MyRabbitMq"
+  operations="unbind renameAndRecreate bind scaledown restage scaleup delete"
+  service=MyRedis
+  serviceDetails[$service,newService]=c-redis
+  serviceDetails[$service,newPlan]=dedicated-cache
+  service=MyRabbitMq
+  serviceDetails[$service,newService]=c-rabbitmq
+  serviceDetails[$service,newPlan]=dedicated
+FILES
+ sss
+  The main script, place it anywhere
+ENVIRONMENT
+ Script requires a standard POSIX environment with CF commandline installed and already logged into a CF site.
+DIAGNOSTICS
+ -d Option may be used for debugging, as of this writing debugging options are not complete and require manipulation of the script.
+BUGS
+ There may be incompatibilities with other versions of the CF cli or CF apis which are not part of the current Comcast ecosystem.
+AUTHOR
+ @aRDy on https://cim.slack.com , or https://www.linkedin.com/in/ardyhash outside our bubble.
+SEE ALSO
+ cf (Cloud Foundry CLI), bash, sed, awk, cat
+HELP
+}
+
+originalParams="$@"
+PARAMS=""
+while (( "$#" )); do
+  case "$1" in
+    -a|--application-name)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+        appsInScope="$appsInScope -e $2"
+        shift 2
+      else
+        echo "Error: Argument for $1 is missing" >&2; helptext
+        exit 1
+      fi
+      ;;
+    -c|--config-file)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+        config=$2
+  if [[ -f $2 ]]; then source $2; else echo "Config file $2 does not exist"; fi
+        shift 2
+      else
+        echo "Error: Argument for $1 is missing" >&2; helptext
+        exit 1
+      fi
+      ;;
+    -s|--services)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+        services=$2
+        shift 2
+      else
+        echo "Error: Argument for $1 is missing" >&2; helptext
+        exit 1
+      fi
+      ;;
+    -o|--operations)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+        operations=$2
+        shift 2
+      else
+        echo "Error: Argument for $1 is missing" >&2; helptext
+        exit 1
+      fi
+      ;;
+    -p|--parallel-operations)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ]; then
+        parallelOperations=$2
+        shift 2
+      else
+        echo "Error: Argument for $1 is missing" >&2; helptext
+        exit 1
+      fi
+      ;;
+    -i|--inline-definition)
+      if [ -n "$2" ] && [ ${2:0:1} != "-" ] && \
+         [ -n "$3" ] && [ ${3:0:1} != "-" ] && \
+   [ -n "$4" ] && [ ${4:0:1} != "-" ]; then
+     service=$2
+           serviceDetails[$service,newService]=$3
+           serviceDetails[$service,newPlan]=$4
+     inlineServices="$inlineServices $service "
+           shift 4
+      else
+        echo "Error: Arguments for $1 are missing" >&2; helptext
+        exit 1
+      fi
+      ;;
+    -d|--debug)
+      debug=1
+      shift
+      ;;
+    -h|--help)
+      helptext; exit 0
+      shift
+      ;;
+    -*|--*=) # unsupported flags
+      echo "Error: Unsupported flag $1" >&2; helptext
+      exit 1
+      ;;
+    *) # preserve positional arguments
+      PARAMS="$PARAMS $1"
+      shift
+      ;;
+  esac
+done
+
+# set positional arguments in their proper place
+eval set -- "$PARAMS"
+
+if [[ -n "$inlineServices" ]]; then services="$inlineServices"; fi
+
+if [[ "$debug" == "1" ]]; then operations="$operations debug"; fi
+
+for operation in $operations; do
+  if [[ ! "$validOperations" == *"$operation"* ]]; then invalidOperations+="$operation "; fi
+done; if [[ ! -z "$invalidOperations" ]]; then
+  echo "Exiting due to the following invalid operations being selected: ${invalidOperations}"
+  exit 1
+fi
+cf target
+if [[ ! $(whoami) == go ]]; then
+  read -p "Current target is listed above, are you sure you wish to continue? " -n 1 -r
+  if [[ ! $REPLY =~ ^[Yy]$ ]]; then printf "\n"; exit 1; fi; printf "\n"
+
+  if [[ "$operations" =~ "scaledown" ]] || \
+     [[ "$operations" =~ "restage"   ]] || \
+     [[ "$operations" =~ "rebind"    ]] || \
+     [[ "$operations" =~ "delete"    ]]; then
+    read -p "Potentially impactfull operations included list of operations (${operations}), are you sure you wish to continue? " -n 1 -r
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then printf "\n"; exit 1; fi; printf "\n"
+  fi
+else printf "Warning, last chance to cancel job (waiting 30 seconds)\n"; sleep 30
+fi
+
+printf "Taking inventory of all applications\n"
+serviceDetails[any,appList]="$(cf apps | sed -n '/^name/,$p' | sed '/^$/q')"
+while read -r name state instances memory disk urls
+do
+  serviceDetails[any,appList,${name},state]="${state}"
+  serviceDetails[any,appList,${name},instances]="${instances}"
+  serviceDetails[any,appList,${name},memory]="${memory}"
+  serviceDetails[any,appList,${name},disk]="${disk}"
+  serviceDetails[any,appList,${name},urls]="${urls}"
+done < <(printf "${serviceDetails[any,appList]}\n" | tail -n +2 )
+printf "${serviceDetails[any,appList]}\n"
+
+function getAppList {
+  if [[ $service == any ]]; then printf "${serviceDetails[any,appList]}\n"
+  else
+    cf service $service | \
+    sed -n '/^bound apps/,$p' | tail -n +3 | sed '/^$/q' | \
+    if [ -z "$appsInScope" ]; then cat; else grep -i $appsInScope; fi
+  fi
+}; export -f getAppList
+
+function bindingOperation {
+  if [[ "$operation" = "bind" ]] || [[ "$operation" = "unbind" ]] ; then 
+    until (cf ${operation}-service $app $service); do
+      printf "${operation}ing failed, waiting $retryWaitSeconds seconds before next attempt"
+      for i in $(seq 1 $retryWaitSeconds); do sleep 1; printf "."; done; printf "\n"
+    done
+    printf "Waiting $timeBetweenOperations seconds before next operation"
+    for i in $(seq 1 $timeBetweenOperations); do sleep 1; printf "."; done; printf "\n"
+  fi
+  if [[ "$operation" = "rebind" ]]; then
+    for operation in unbind bind; do bindingOperation; done
+    operation=rebind
+  fi
+}; export -f bindingOperation
+
+function divider { printf '=-=+=-=+=-=+=-=+=-=+=-=+=-=+=-=+=-=+=-=+=-=+=-=+=-=+=-=+=-=\n'; }; export -f divider
+
+for operation in $operations; do
+  for service in $services; do
+    if [[ "$operation" == "unbind" ]] || [[ "$operation" == "debug" ]] || [[ "$operation" == "validate" ]]; then
+      printf "Generating list of services bound to ${service}\n"
+      serviceDetails[${service},appList]=$(getAppList | awk '{print $1}')
+      printf "${serviceDetails[${service},appList]}\n"
+    fi
+    appList=$( \
+    if [[ $operation == rebind ]]; then getAppList | grep -i -e "create failed" | awk '{print $1}'
+    else printf "${serviceDetails[${service},appList]}"; fi )
+    for app in $appList; do
+      bindingOperation;
+    done
+    if [[ "$operation" == "renameAndRecreate" ]]; then
+      cf rename-service ${service} ${service}_$timeStamp && \
+      ( set -x
+      cf rename-service ${service}_New ${service} ||
+      cf create-service \
+      ${serviceDetails[$service,newService]} \
+      ${serviceDetails[$service,newPlan]} \
+      ${service}
+      set +x )
+    elif [[ "$operation" == "delete" ]]; then
+      cf delete-service ${service}_$timeStamp -f
+    fi
+  done
+  appList="$( for service in $services; do getAppList | \
+  if [[ $service == any ]]; then cat | tail -n +2; else grep -e 'create succeeded'; fi; done | sort | uniq | awk '{print $1}')"
+  for app in $appList; do
+    if [[ "$operation" == "scaledown" ]]; then
+      echo "cf scale $app -i 1"
+    elif [[ "$operation" == "restage" ]]; then
+      echo "cf restage $app"
+    elif [[ "$operation" == "scaleup" ]]; then
+      instances=$(printf "${serviceDetails[any,appList,${app},instances]}" | cut -d '/' -f2)
+      echo "cf scale $app -i $instances"
+    fi
+  done | xargs -L1 -P$parallelOperations -I{} bash -c {}
+  if [[ "$operation" == "validate" ]]; then
+    appList="$(for service in $services; do printf "${serviceDetails[${service},appList]}\n"; done | sort | uniq)"
+    serviceInstances="$(for service in $services; do printf "\"${serviceDetails[$service,newService]}\",\n"; done)"
+    grepServices=""
+    for serviceInstance in $serviceInstances; do grepServices+="-e $serviceInstance "; done
+    printf "Generating table with app names and service bindings...\n"
+    for app in $appList; do
+      printf "$app $(cf env $app | grep -i $grepServices | cut -d'"' -f4 | tr "\n" " ")\n"
+    done | column -t
+  fi
+done
+if [[ $debug = 1 ]]; then for i in "${!serviceDetails[@]}"; do printf "$i:\t${serviceDetails[$i]}\n"; done | column -t | sort; fi
+
+if [[ ! $service == any ]]; then
+  printf "Looking for applications which failed to bind to service\n"
+  for service in $services; do
+    printf "Service: $service\n"
+    getAppList |  grep -v -e 'create succeeded'
+  done
+  printf "You may retry binding and staging of failed applications by running ./sss $originalParams -o 'rebind restage' to retry the failed services\n"
+fi
